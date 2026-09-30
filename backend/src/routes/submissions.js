@@ -27,10 +27,10 @@ router.post('/submissions', (req, res) => {
     });
   }
 
-  // 4. 정상 요청 시 1회차 Mock 결과 반환
+  // 4. 2회차 요구사항에 맞춘 임시(Mock) 채점 결과 반환
   return res.json({
     submissionId: 1,
-    result: 'AC'
+    status: 'AC'
   });
 });
 
