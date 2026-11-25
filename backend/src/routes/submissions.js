@@ -5,8 +5,7 @@ const {
   getSubmissionById,
   getPendingSubmissionIdsBefore,
   updatePendingSubmission,
-  // 팀장이 ../../DB/method/submissions에 export한 경우 아래 주석을 풀어서 사용하세요:
-  // getSubmissionsByUserId,
+  getSubmissionByuserId,
 } = require('../../DB/method/submissions');
 const JUDGE_SERVER_URL = process.env.JUDGE_SERVER_URL;
 const JUDGE_CALLBACK_TOKEN = process.env.JUDGE_CALLBACK_TOKEN;
@@ -184,12 +183,12 @@ router.get('/submissions', async (req, res) => {
     return res.status(400).json({ error: '올바른 userId가 필요합니다.' });
   }
 
-  if (typeof getSubmissionsByUserId !== 'function') {
+  if (typeof getSubmissionByuserId !== 'function') {
     return res.status(500).json({ error: '제출 목록을 불러오지 못했습니다.' });
   }
 
   try {
-    const submissions = await getSubmissionsByUserId(userId);
+    const submissions = await getSubmissionByuserId(userId);
     return res.status(200).json({ submissions });
   } catch (error) {
     console.error('Failed to fetch submissions:', error);
