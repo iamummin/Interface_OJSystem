@@ -1,8 +1,84 @@
 const express = require('express');
 const router = express.Router();
+const {
+  createSubmission,
+  getSubmissionById,
+  getPendingSubmissionIdsBefore,
+  updatePendingSubmission,
+  // 팀장이 ../../DB/method/submissions에 export한 경우 아래 주석을 풀어서 사용하세요:
+  // getSubmissionsByUserId,
+} = require('../../DB/method/submissions');
+const JUDGE_SERVER_URL = process.env.JUDGE_SERVER_URL;
+const JUDGE_CALLBACK_TOKEN = process.env.JUDGE_CALLBACK_TOKEN;
+const JUDGE_REQUEST_TIMEOUT_MS = 5000;
+const PENDING_TIMEOUT_MS = 5 * 60 * 1000;
+const PENDING_SWEEP_INTERVAL_MS = 30 * 1000;
+const allowedResults = ['AC', 'WA', 'CE', 'RE', 'TLE', 'MLE', 'OLE', 'JE'];
+const resultStreams = new Map();
+const heartbeatTimers = new WeakMap();
+
+if (!JUDGE_SERVER_URL) {
+  throw new Error('Missing environment variable: JUDGE_SERVER_URL');
+}
+
+if (!JUDGE_CALLBACK_TOKEN) {
+  throw new Error('Missing environment variable: JUDGE_CALLBACK_TOKEN');
+}
+
+function sendResult(stream, submissionId, result) {
+  stream.write(`data: ${JSON.stringify({ submissionId, result })}\n\n`);
+}
+
+function clearHeartbeat(stream) {
+  const timer = heartbeatTimers.get(stream);
+  if (!timer) return;
+
+  clearInterval(timer);
+  heartbeatTimers.delete(stream);
+}
+
+function closeResultStreams(submissionId, result) {
+  const streams = resultStreams.get(submissionId);
+  if (!streams) return;
+
+  for (const stream of streams) {
+    clearHeartbeat(stream);
+    if (stream.destroyed || stream.writableEnded) continue;
+
+    sendResult(stream, submissionId, result);
+    stream.end();
+  }
+
+  resultStreams.delete(submissionId);
+}
+
+async function markSubmissionAsJudgeError(submissionId) {
+  try {
+    const affectedRows = await updatePendingSubmission(submissionId, 'JE');
+    if (affectedRows > 0) closeResultStreams(submissionId, 'JE');
+  } catch (err) {
+    console.error('Failed to mark submission as JE:', err);
+  }
+}
+
+async function expireStaleSubmissions() {
+  try {
+    const cutoff = new Date(Date.now() - PENDING_TIMEOUT_MS);
+    const submissionIds = await getPendingSubmissionIdsBefore(cutoff);
+
+    for (const submissionId of submissionIds) {
+      const affectedRows = await updatePendingSubmission(submissionId, 'JE');
+      if (affectedRows > 0) closeResultStreams(submissionId, 'JE');
+    }
+  } catch (err) {
+    console.error('Failed to expire stale submissions:', err);
+  }
+}
+
+setInterval(expireStaleSubmissions, PENDING_SWEEP_INTERVAL_MS).unref();
 
 // POST /api/submissions
-router.post('/submissions', (req, res) => {
+router.post('/submissions', async (req, res) => {
   const { problemId, language, source } = req.body;
 
   // 1. 필수 필드 존재 여부 검증
@@ -27,62 +103,232 @@ router.post('/submissions', (req, res) => {
     });
   }
 
-  // 4. 2회차 요구사항에 맞춘 임시(Mock) 채점 결과 반환
-  return res.json({
-    submissionId: 1,
-    status: 'AC'
-  });
-});
-// 임시 제출 데이터 (추후 DB 조회 로직으로 교체 가능)
-const dummySubmissions = [
-  {
-    submissionId: 1,
-    userId: 1,
-    problemId: 1000,
-    language: 'Python',
-    status: 'AC',
-  },
-  {
-    submissionId: 2,
-    userId: 1,
-    problemId: 1001,
-    language: 'C++',
-    status: 'WA',
-  },
-];
+  const userId = req.body.userId;
+  let submissionId;
 
-async function getSubmissionsByUserId(userId) {
-  return dummySubmissions.filter((item) => item.userId === userId);
-}
-
-// GET /api/submissions?userId=...
-router.get('/submissions', async (req, res) => {
   try {
-    const rawUserId = req.query.userId;
-
-    // 1. 문자열이 엄격한 양의 정수 형식인지 확인
-    if (typeof rawUserId !== 'string' || !/^\d+$/.test(rawUserId)) {
-      return res.status(400).json({
-        error: '올바른 userId가 필요합니다.',
-      });
-    }
-
-    const userId = Number(rawUserId);
-
-    // 2. 1 ~ 4,294,967,295 범위 검증
-    if (!Number.isInteger(userId) || userId < 1 || userId > 4294967295) {
-      return res.status(400).json({
-        error: '올바른 userId가 필요합니다.',
-      });
-    }
-
-    const submissions = await getSubmissionsByUserId(userId);
-    return res.status(200).json({ submissions });
+    submissionId = await createSubmission(
+      problemId,
+      userId,
+      language,
+      source
+    );
   } catch (err) {
-    console.error('GET /submissions error:', err);
+    console.error('Failed to save submission:', err);
+
     return res.status(500).json({
-      error: '제출 목록을 불러오지 못했습니다.',
+      error: 'Failed to save submission.'
+    });
+  }
+
+  try {
+    // Backend -> Go Judge
+    const judgeResponse = await fetch(
+      `${JUDGE_SERVER_URL}/api/submissions`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${JUDGE_CALLBACK_TOKEN}`
+        },
+        body: JSON.stringify({
+          submissionId,
+          problemId,
+          language,
+          source
+        }),
+        signal: AbortSignal.timeout(JUDGE_REQUEST_TIMEOUT_MS)
+      }
+    );
+
+    if (!judgeResponse.ok) {
+      await markSubmissionAsJudgeError(submissionId);
+
+      return res.status(502).json({
+        error: 'Judge server request failed.',
+        submissionId,
+        result: 'JE'
+      });
+    }
+
+    return res.status(202).json({
+      submissionId,
+      result: "PENDING"
+    });
+
+  } catch (err) {
+    console.error('Judge server connection failed:', err);
+    await markSubmissionAsJudgeError(submissionId);
+
+    return res.status(502).json({
+      error: 'Failed to connect to judge server.',
+      submissionId,
+      result: 'JE'
     });
   }
 });
+
+// GET /api/submissions?userId=...
+router.get('/submissions', async (req, res) => {
+  const value = typeof req.query.userId === 'string'
+    ? req.query.userId.trim()
+    : '';
+  const userId = Number(value);
+
+  if (
+    !/^\d+$/.test(value) ||
+    !Number.isSafeInteger(userId) ||
+    userId <= 0 ||
+    userId > 4294967295
+  ) {
+    return res.status(400).json({ error: '올바른 userId가 필요합니다.' });
+  }
+
+  if (typeof getSubmissionsByUserId !== 'function') {
+    return res.status(500).json({ error: '제출 목록을 불러오지 못했습니다.' });
+  }
+
+  try {
+    const submissions = await getSubmissionsByUserId(userId);
+    return res.status(200).json({ submissions });
+  } catch (error) {
+    console.error('Failed to fetch submissions:', error);
+    return res.status(500).json({ error: '제출 목록을 불러오지 못했습니다.' });
+  }
+});
+
+// GET /api/submissions/:id - fallback result lookup used when SSE disconnects.
+router.get('/submissions/:id', async (req, res) => {
+  const submissionId = Number(req.params.id);
+
+  if (!Number.isSafeInteger(submissionId) || submissionId <= 0) {
+    return res.status(400).json({ error: 'Invalid submission ID.' });
+  }
+
+  try {
+    const submission = await getSubmissionById(submissionId);
+    if (!submission) {
+      return res.status(404).json({ error: 'Submission not found.' });
+    }
+
+    return res.status(200).json({
+      submissionId: submission.submitid,
+      result: submission.status,
+    });
+  } catch (err) {
+    console.error('Failed to find submission:', err);
+    return res.status(500).json({ error: 'Failed to find submission.' });
+  }
+});
+
+// GET /api/submissions/:id/events - stream the final judge result to the UI.
+router.get('/submissions/:id/events', async (req, res) => {
+  const submissionId = Number(req.params.id);
+
+  if (!Number.isSafeInteger(submissionId) || submissionId <= 0) {
+    return res.status(400).json({ error: 'Invalid submission ID.' });
+  }
+
+  let submission;
+  try {
+    submission = await getSubmissionById(submissionId);
+  } catch (err) {
+    console.error('Failed to find submission:', err);
+    return res.status(500).json({ error: 'Failed to find submission.' });
+  }
+
+  if (!submission) {
+    return res.status(404).json({ error: 'Submission not found.' });
+  }
+
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+
+  if (submission.status !== 'PENDING') {
+    sendResult(res, submissionId, submission.status);
+    return res.end();
+  }
+
+  const streams = resultStreams.get(submissionId) ?? new Set();
+  streams.add(res);
+  resultStreams.set(submissionId, streams);
+
+  const heartbeat = setInterval(() => {
+    if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n\n');
+  }, 15000);
+  heartbeat.unref();
+  heartbeatTimers.set(res, heartbeat);
+
+  res.on('close', () => {
+    clearHeartbeat(res);
+    streams.delete(res);
+    if (streams.size === 0) resultStreams.delete(submissionId);
+  });
+
+  // Recheck after registration so a result arriving during setup is not lost.
+  try {
+    const latestSubmission = await getSubmissionById(submissionId);
+    if (
+      latestSubmission &&
+      latestSubmission.status !== 'PENDING' &&
+      !res.writableEnded
+    ) {
+      closeResultStreams(submissionId, latestSubmission.status);
+    }
+  } catch (err) {
+    console.error('Failed to refresh submission:', err);
+  }
+});
+
+// 결과 반환
+router.post('/result', async (req, res) => {
+  if (req.get('Authorization') !== `Bearer ${JUDGE_CALLBACK_TOKEN}`) {
+    return res.status(401).json({ error: 'Unauthorized judge callback.' });
+  }
+
+  const submissionId = req.body?.SubmissionID;
+  const result = req.body?.Result;
+
+  if (
+    !Number.isSafeInteger(submissionId) ||
+    submissionId <= 0 ||
+    !allowedResults.includes(result)
+  ) {
+    return res.status(400).json({ error: 'Invalid judge result.' });
+  }
+
+  console.log('Judge result received:', req.body);
+
+  try {
+    const affectedRows = await updatePendingSubmission(submissionId, result);
+
+    if (affectedRows === 0) {
+      const submission = await getSubmissionById(submissionId);
+      if (!submission) {
+        return res.status(404).json({ error: 'Submission not found.' });
+      }
+
+      return res.status(200).json({
+        message: 'Result ignored because submission is already final.',
+        submissionId,
+        result: submission.status,
+      });
+    }
+  } catch (err) {
+    console.error('Failed to save judge result:', err);
+    return res.status(500).json({ error: 'Failed to save judge result.' });
+  }
+
+  closeResultStreams(submissionId, result);
+
+  return res.status(200).json({
+    message: 'Result received'
+  });
+});
+
 module.exports = router;
